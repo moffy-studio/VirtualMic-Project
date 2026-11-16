@@ -1,0 +1,3 @@
+MoffyVMic is packaged as a single all-in-one setup for Windows. This installer includes the application, bundled dependencies, and standard runtime resources needed for a clean installation. 
+
+Moffy Studio

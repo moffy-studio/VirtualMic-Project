@@ -68,9 +68,9 @@ namespace VirtualMicMixer
             this.SuspendLayout();
 
             // ── Form ─────────────────────────────────────────────────────────
-            this.Text = "Virtual Mic Mixer  –  VB-CABLE + NAudio";
-            this.Size = new Size(860, 640);
-            this.MinimumSize = new Size(860, 640);
+            this.Text = "MoffyVMic - " + Application.ProductVersion + " - (" + Environment.UserName + ")";
+            this.Size = new Size(870, 620);
+            this.MinimumSize = new Size(860, 620);
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
             this.Font = new Font("Segoe UI", 9f);
@@ -362,7 +362,7 @@ namespace VirtualMicMixer
             // ── Info panel ────────────────────────────────────────────────────
             var pnlInfo = new Panel
             {
-                Location = new Point(8, 178),
+                Location = new Point(8, 185),
                 Size = new Size(390, 140),
                 BackColor = Color.FromArgb(30, 30, 34),
                 BorderStyle = BorderStyle.FixedSingle
@@ -424,7 +424,7 @@ namespace VirtualMicMixer
             tmrPosition.Tick += TmrPosition_Tick;
 
             // ══ MIC GROUP ═══════════════════════════════════════════════════
-            grpMic = MakeGroup("  🎤  Microphone", 8, 474, 838, 80);
+            grpMic = MakeGroup("  🎤  Microphone", 8, 474, 838, 65);
 
             btnEnableMic = MakeButton("Enable Mic", 10, 18, 100, 30);
             btnEnableMic.BackColor = Color.FromArgb(0, 100, 160);
