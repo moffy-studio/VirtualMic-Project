@@ -43,8 +43,10 @@ namespace VirtualMicMixer.Core
         private WaveOutEvent _vbCableOut;
 
         // ── Music playback ───────────────────────────────────────────────────
-        private AudioFileReader _musicReader;
+        private WaveStream _musicReader;          // set only for seekable sources (files / MF streams)
         private MixerChannel _musicChannel;
+        private IDisposable _musicLifetime;       // owns the ffmpeg process for pipe streams
+        private CountingSampleProvider _musicCounter;
 
         // ── Mic capture ──────────────────────────────────────────────────────
         private WaveInEvent _micCapture;
@@ -54,9 +56,14 @@ namespace VirtualMicMixer.Core
 
         // ── Public state ─────────────────────────────────────────────────────
         public bool IsRunning { get; private set; }
-        public bool IsMusicLoaded => _musicReader != null;
+        public bool IsMusicLoaded => _musicChannel != null;
+        public bool IsMusicSeekable => _musicReader != null;
 
-        public TimeSpan MusicPosition => _musicReader?.CurrentTime ?? TimeSpan.Zero;
+        public TimeSpan MusicPosition =>
+            _musicReader != null
+                ? _musicReader.CurrentTime
+                : (_musicCounter?.Elapsed ?? TimeSpan.Zero);
+
         public TimeSpan MusicDuration => _musicReader?.TotalTime ?? TimeSpan.Zero;
 
         // ── Events ───────────────────────────────────────────────────────────
@@ -132,12 +139,73 @@ namespace VirtualMicMixer.Core
                 ? (ISampleProvider)new LoopingReader(reader)
                 : new EndDetectingReader(reader, OnMusicEndBackground);
 
+            AttachMusicChannel(source, reader, null, null);
+        }
+
+        /// <summary>
+        /// Plays a remote audio URL (MP3/M4A over HTTP, or a yt-dlp direct URL)
+        /// through Media Foundation.  The URL must be seekable for position and
+        /// seeking to work; live/HLS URLs usually fail here, so callers should
+        /// fall back to <see cref="LoadMusic(ProcessAudioStream)"/>.
+        /// </summary>
+        public void LoadMusicStream(string streamUrl)
+        {
+            RemoveMusicChannelSafe();
+
+            var reader = new MediaFoundationReader(streamUrl);
+            try
+            {
+                var source = new EndDetectingReader(reader.ToSampleProvider(), OnMusicEndBackground);
+                AttachMusicChannel(source, reader, null, null);
+            }
+            catch
+            {
+                reader.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Plays an ffmpeg PCM pipe (live streams and formats Media Foundation
+        /// cannot open).  No seek/duration is available for this source; the
+        /// engine takes ownership of <paramref name="stream"/>.
+        /// </summary>
+        public void LoadMusic(ProcessAudioStream stream)
+        {
+            if (stream == null) throw new ArgumentNullException(nameof(stream));
+
+            RemoveMusicChannelSafe();
+
+            var counter = new CountingSampleProvider(stream.Source);
+            var source = new EndDetectingReader(counter, OnMusicEndBackground);
+            AttachMusicChannel(source, null, stream, counter);
+        }
+
+        private void AttachMusicChannel(
+            ISampleProvider source, WaveStream reader, IDisposable lifetime, CountingSampleProvider counter)
+        {
             var channel = new MixerChannel(source, "Music", MixFormat);
 
             // ② Store references, then add to mixer.
             _musicReader = reader;
+            _musicCounter = counter;
+            _musicLifetime = lifetime;
             _musicChannel = channel;
-            _mixer.AddMixerInput(channel);
+
+            try
+            {
+                _mixer.AddMixerInput(channel);
+            }
+            catch
+            {
+                _musicChannel = null;
+                _musicReader = null;
+                _musicCounter = null;
+                _musicLifetime = null;
+                reader?.Dispose();
+                lifetime?.Dispose();
+                throw;
+            }
         }
 
         public void PauseMusic() { if (_musicChannel != null) _musicChannel.IsMuted = true; }
@@ -147,7 +215,9 @@ namespace VirtualMicMixer.Core
 
         public void SeekMusic(TimeSpan position)
         {
-            if (_musicReader != null) _musicReader.CurrentTime = position;
+            if (_musicReader == null) return;
+            try { _musicReader.CurrentTime = position; }
+            catch (Exception) { /* non-seekable remote stream – ignore */ }
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -223,6 +293,9 @@ namespace VirtualMicMixer.Core
             }
             _musicReader?.Dispose();
             _musicReader = null;
+            _musicLifetime?.Dispose();
+            _musicLifetime = null;
+            _musicCounter = null;
         }
 
         /// <summary>
@@ -262,6 +335,40 @@ namespace VirtualMicMixer.Core
                 else total += read;
             }
             return total;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CountingSampleProvider – tracks playback position for non-seekable
+    // sources (ffmpeg pipes), where no WaveStream position exists.
+    // ════════════════════════════════════════════════════════════════════════
+    internal class CountingSampleProvider : ISampleProvider
+    {
+        private readonly ISampleProvider _source;
+        private long _samplesRead;
+
+        public WaveFormat WaveFormat => _source.WaveFormat;
+
+        public CountingSampleProvider(ISampleProvider source) => _source = source;
+
+        public TimeSpan Elapsed
+        {
+            get
+            {
+                long samples = Interlocked.Read(ref _samplesRead);
+                int rate = WaveFormat.SampleRate;
+                int channels = WaveFormat.Channels;
+                return rate > 0 && channels > 0
+                    ? TimeSpan.FromSeconds((double)samples / rate / channels)
+                    : TimeSpan.Zero;
+            }
+        }
+
+        public int Read(float[] buffer, int offset, int count)
+        {
+            int read = _source.Read(buffer, offset, count);
+            if (read > 0) Interlocked.Add(ref _samplesRead, read);
+            return read;
         }
     }
 

@@ -2,8 +2,11 @@
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using VirtualMicMixer.Core;
+using VirtualMicMixer.Properties;
 
 namespace VirtualMicMixer
 {
@@ -20,6 +23,17 @@ namespace VirtualMicMixer
         // ── State flags ───────────────────────────────────────────────────────
         private bool _engineRunning;
         private bool _musicPaused;
+        private bool _playingStream;
+        private bool _streamBusy;
+        private bool _uiReady;
+        private bool _closing;
+        private string _streamTitle;
+
+        // ── Streaming ─────────────────────────────────────────────────────────
+        private string _ytDlpPath;
+        private string _cookiesFile;
+        private CancellationTokenSource _streamCts;
+        private readonly ToolTip _toolTip = new ToolTip();
 
         // ── Colors for toggle-button active state ─────────────────────────────
         private static readonly Color ClrToggleOn = Color.FromArgb(0, 110, 180);
@@ -29,11 +43,18 @@ namespace VirtualMicMixer
         public MainForm()
         {
             InitializeComponent();
+            BuildLayout();   // code-built UI lives in MainForm.Layout.cs
             LoadDevices();
+            LoadStreamSettings();
             UpdateUI();
             RefreshPlaylistView();
 
-            this.FormClosing += (s, e) => _engine.Dispose();
+            this.FormClosing += (s, e) =>
+            {
+                _closing = true;
+                _streamCts?.Cancel();
+                _engine.Dispose();
+            };
             _engine.MusicFinished += Engine_MusicFinished;
         }
 
@@ -71,8 +92,11 @@ namespace VirtualMicMixer
         {
             if (_engineRunning)
             {
+                _streamCts?.Cancel();
                 _engine.Stop();
                 _engineRunning = false;
+                _playingStream = false;
+                _musicPaused = false;
                 tmrPosition.Stop();
                 btnInitEngine.Text = "▶  Start Engine";
                 btnInitEngine.BackColor = Color.FromArgb(0, 120, 60);
@@ -110,6 +134,333 @@ namespace VirtualMicMixer
                 MessageBox.Show($"Failed to start engine:\n{ex.Message}", "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        // ══ STREAMING (YouTube / direct URL) ══════════════════════════════════
+        private void LoadStreamSettings()
+        {
+            _ytDlpPath = YouTubeAudioService.FindYtDlp(Settings.Default.YtDlpPath);
+
+            string browser = Settings.Default.CookieBrowser;
+            int index = string.IsNullOrEmpty(browser) ? -1 : cmbCookies.Items.IndexOf(browser);
+            cmbCookies.SelectedIndex = index > 0 ? index : 0;
+
+            _cookiesFile = Settings.Default.CookiesFile;
+
+            UpdateYtDlpStatus();
+            UpdateCookieState();
+            _uiReady = true;
+        }
+
+        private void UpdateYtDlpStatus()
+        {
+            _ytDlpPath = YouTubeAudioService.FindYtDlp(Settings.Default.YtDlpPath);
+
+            bool found = _ytDlpPath != null;
+            lblYtDlpStatus.Text = found ? "yt-dlp: ready" : "yt-dlp: missing";
+            lblYtDlpStatus.ForeColor = found
+                ? Color.FromArgb(110, 200, 120)
+                : Color.FromArgb(235, 145, 90);
+            _toolTip.SetToolTip(lblYtDlpStatus,
+                found ? _ytDlpPath : "yt-dlp.exe was not found. Click “…” to locate it.");
+        }
+
+        private void BtnBrowseYtDlp_Click(object sender, EventArgs e)
+        {
+            using (var dlg = new OpenFileDialog())
+            {
+                dlg.Title = "Locate yt-dlp.exe";
+                dlg.Filter = "yt-dlp|yt-dlp.exe|Executables|*.exe";
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+
+                Settings.Default.YtDlpPath = dlg.FileName;
+                Settings.Default.Save();
+                UpdateYtDlpStatus();
+                SetStatus($"yt-dlp set to: {dlg.FileName}");
+            }
+        }
+
+        private void CmbCookies_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (!_uiReady) return;
+            Settings.Default.CookieBrowser = SelectedCookieBrowser ?? string.Empty;
+            Settings.Default.Save();
+            UpdateCookieState();
+        }
+
+        private void BtnCookiesFile_Click(object sender, EventArgs e)
+        {
+            using (var dlg = new OpenFileDialog())
+            {
+                dlg.Title = "Select a cookies.txt exported from your browser";
+                dlg.Filter = "Cookies file (Netscape format)|*.txt|All files|*.*";
+                if (!string.IsNullOrWhiteSpace(_cookiesFile) && File.Exists(_cookiesFile))
+                    dlg.FileName = _cookiesFile;
+
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+
+                if (!YouTubeAudioService.LooksLikeNetscapeCookies(dlg.FileName))
+                {
+                    DialogResult answer = MessageBox.Show(
+                        "This file does not look like a Netscape cookies.txt export.\r\n\r\nUse it anyway?",
+                        "Cookies file", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (answer != DialogResult.Yes) return;
+                }
+
+                Settings.Default.CookiesFile = dlg.FileName;
+                Settings.Default.Save();
+                _cookiesFile = dlg.FileName;
+                UpdateCookieState();
+                SetStatus("Cookies file loaded: " + Path.GetFileName(dlg.FileName));
+            }
+        }
+
+        private void BtnCookiesClear_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(_cookiesFile)) return;
+
+            Settings.Default.CookiesFile = string.Empty;
+            Settings.Default.Save();
+            _cookiesFile = null;
+            UpdateCookieState();
+            SetStatus("Cookies file cleared.");
+        }
+
+        private void LnkCookieHelp_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
+        {
+            MessageBox.Show(
+                "Option 1 – read cookies from your browser\r\n" +
+                "1. Log in to YouTube in Chrome, Edge or Firefox.\r\n" +
+                "2. Close that browser completely (also from the system tray).\r\n" +
+                "3. Select the browser in the Cookies box.\r\n\r\n" +
+                "Option 2 – use a cookies.txt file (browser can stay open)\r\n" +
+                "1. Install a cookie-export extension, e.g. “Get cookies.txt LOCALLY”.\r\n" +
+                "2. Open youtube.com, then export the cookies for youtube.com.\r\n" +
+                "3. Click the 📄 button and select the .txt file.\r\n\r\n" +
+                "Keep the file private – it grants access to your YouTube session.",
+                "How to get YouTube cookies",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void UpdateCookieState()
+        {
+            btnCookiesClear.Enabled = !string.IsNullOrWhiteSpace(_cookiesFile);
+
+            if (!string.IsNullOrWhiteSpace(_cookiesFile))
+            {
+                bool exists = File.Exists(_cookiesFile);
+                lblCookieState.Text = exists
+                    ? "Cookies file: " + Path.GetFileName(_cookiesFile)
+                    : "Cookies file not found: " + _cookiesFile;
+                lblCookieState.ForeColor = exists
+                    ? Color.FromArgb(110, 200, 120)
+                    : Color.FromArgb(235, 145, 90);
+                _toolTip.SetToolTip(lblCookieState, _cookiesFile);
+                _toolTip.SetToolTip(cmbCookies, "Ignored while a cookies.txt file is loaded");
+                return;
+            }
+
+            string browser = SelectedCookieBrowser;
+            if (!string.IsNullOrEmpty(browser))
+            {
+                lblCookieState.Text = $"Cookies: browser ({browser}) – close it completely before streaming";
+                lblCookieState.ForeColor = Color.FromArgb(200, 200, 120);
+            }
+            else
+            {
+                lblCookieState.Text = "Cookies: none – YouTube may ask for a sign-in check";
+                lblCookieState.ForeColor = Color.FromArgb(150, 150, 150);
+            }
+            _toolTip.SetToolTip(lblCookieState, string.Empty);
+            _toolTip.SetToolTip(cmbCookies, "Read YouTube cookies from this browser's profile");
+        }
+
+        private string SelectedCookieBrowser =>
+            cmbCookies.SelectedIndex > 0 ? cmbCookies.SelectedItem as string : null;
+
+        private async void BtnStream_Click(object sender, EventArgs e)
+        {
+            if (_streamBusy) return;
+
+            string url = txtStreamUrl.Text.Trim();
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                SetStatus("⚠  Paste a YouTube link or audio URL first.", Color.Orange);
+                return;
+            }
+            if (!Uri.IsWellFormedUriString(url, UriKind.Absolute))
+            {
+                SetStatus("⚠  That does not look like a valid link.", Color.Orange);
+                return;
+            }
+            if (!_engineRunning)
+            {
+                SetStatus("⚠  Start the engine first.", Color.Orange);
+                return;
+            }
+
+            _streamCts?.Cancel();
+            _streamCts?.Dispose();
+            _streamCts = new CancellationTokenSource();
+            CancellationToken ct = _streamCts.Token;
+
+            SetStreamBusy(true);
+            try
+            {
+                _engine.StopMusic();
+                _musicPaused = false;
+                _playingStream = false;
+
+                string title;
+                string streamWarning = null;
+                bool loaded;
+
+                if (YouTubeAudioService.IsDirectAudioUrl(url))
+                {
+                    title = Path.GetFileNameWithoutExtension(new Uri(url).AbsolutePath);
+                    SetStatus("⏳ Opening audio stream…");
+                    loaded = await TryLoadUrlStreamAsync(url, ct);
+                    if (!loaded)
+                        loaded = await StartPcmFallbackAsync(url, ct);
+                }
+                else
+                {
+                    SetStatus("🔎 Resolving link with yt-dlp…");
+                    StreamInfo info = await YouTubeAudioService.ResolveAsync(
+                        url, _ytDlpPath, SelectedCookieBrowser, _cookiesFile, ct);
+
+                    ct.ThrowIfCancellationRequested();
+
+                    title = info.Title;
+                    streamWarning = info.Warning;
+                    loaded = !info.IsLive && await TryLoadUrlStreamAsync(info.StreamUrl, ct);
+                    if (!loaded)
+                        loaded = await StartPcmFallbackAsync(info.StreamUrl, ct);
+                }
+
+                if (_closing || IsDisposed)
+                {
+                    _engine.StopMusic();
+                    return;
+                }
+
+                if (!loaded)
+                    throw new InvalidOperationException("The audio stream could not be opened.");
+
+                _playingStream = true;
+                _streamTitle = title;
+                _engine.MusicVolume = trkMusicVol.Value / 100f;
+
+                trkSeek.Value = 0;
+                trkSeek.Maximum = Math.Max(1, (int)_engine.MusicDuration.TotalSeconds);
+                lblNowPlaying.Text = "🌐  " + title;
+                lblMusicPos.Text = "0:00";
+                lblMusicDur.Text = _engine.MusicDuration.TotalSeconds > 0
+                    ? $"/ {FormatTime(_engine.MusicDuration)}"
+                    : "/ live";
+
+                SetStatus($"▶  Streaming: {title}");
+                if (!string.IsNullOrEmpty(streamWarning))
+                    SetStatus("⚠  " + streamWarning, Color.Orange);
+                UpdateInfoPanel();
+            }
+            catch (OperationCanceledException)
+            {
+                _engine.StopMusic();
+                if (!_closing && !IsDisposed) SetStatus("Stream cancelled.");
+            }
+            catch (Exception ex)
+            {
+                _engine.StopMusic();
+                _playingStream = false;
+                if (_closing || IsDisposed) return;
+
+                lblNowPlaying.Text = "— No track selected —";
+                SetStatus("⚠  Cannot stream: " + FirstLine(ex.Message), Color.Orange);
+                MessageBox.Show(ex.Message, "Streaming Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            finally
+            {
+                if (!_closing && !IsDisposed)
+                {
+                    SetStreamBusy(false);
+                    UpdateUI();
+                }
+            }
+        }
+
+        /// <summary>Loads a seekable remote URL via Media Foundation. Returns false on failure.</summary>
+        private async Task<bool> TryLoadUrlStreamAsync(string streamUrl, CancellationToken ct)
+        {
+            try
+            {
+                await Task.Run(() => _engine.LoadMusicStream(streamUrl), ct);
+                return _engine.IsMusicLoaded;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception) { return false; }
+        }
+
+        /// <summary>
+        /// Starts the ffmpeg PCM pipe (live streams / containers Media Foundation
+        /// cannot open) and waits until audio is actually flowing or ffmpeg failed.
+        /// </summary>
+        private async Task<bool> StartPcmFallbackAsync(string streamUrl, CancellationToken ct)
+        {
+            ProcessAudioStream session = null;
+            try
+            {
+                SetStatus("⏳ Opening live audio stream…");
+                string ffmpeg = YouTubeAudioService.FindFfmpeg();
+                session = await Task.Run(
+                    () => YouTubeAudioService.StartPcmStream(ffmpeg, streamUrl), ct);
+
+                for (int i = 0; i < 50 && !ct.IsCancellationRequested; i++)
+                {
+                    if (session.BufferedBytes > 0) break;
+                    if (session.Ended) break;
+                    await Task.Delay(200, ct);
+                }
+
+                if (session.Ended)
+                {
+                    string detail = session.ErrorText;
+                    session.Dispose();
+                    throw new InvalidOperationException(
+                        string.IsNullOrWhiteSpace(detail)
+                            ? "The stream ended before any audio was received."
+                            : detail);
+                }
+
+                _engine.LoadMusic(session);
+                return _engine.IsMusicLoaded;
+            }
+            catch
+            {
+                session?.Dispose();
+                throw;
+            }
+        }
+
+        private void TxtStreamUrl_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter || _streamBusy) return;
+            e.SuppressKeyPress = true;
+            BtnStream_Click(sender, e);
+        }
+
+        private void SetStreamBusy(bool busy)
+        {
+            _streamBusy = busy;
+            btnStream.Text = busy ? "⏳  Loading…" : "▶  Stream";
+            txtStreamUrl.Enabled = !busy;
+            btnBrowseYtDlp.Enabled = !busy;
+            cmbCookies.Enabled = !busy;
+            btnCookiesFile.Enabled = !busy;
+            btnCookiesClear.Enabled = !busy && !string.IsNullOrWhiteSpace(_cookiesFile);
+            btnStream.Enabled = !busy;
+            Cursor = busy ? Cursors.WaitCursor : Cursors.Default;
         }
 
         // ══ PLAYLIST – FOLDER LOADING ═════════════════════════════════════════
@@ -168,8 +519,10 @@ namespace VirtualMicMixer
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (result != DialogResult.Yes) return;
 
+            _streamCts?.Cancel();
             _engine.StopMusic();
             _musicPaused = false;
+            _playingStream = false;
             _playlist.Clear();
             RefreshPlaylistView();
             lblNowPlaying.Text = "— No track selected —";
@@ -244,7 +597,7 @@ namespace VirtualMicMixer
                 int qi = (int)lstPlaylist.SelectedItems[0].Tag;
                 bool isCurrent = (qi == _playlist.CurrentIndex);
                 _playlist.RemoveAt(qi);
-                if (isCurrent) { _engine.StopMusic(); _musicPaused = false; }
+                if (isCurrent) { _engine.StopMusic(); _musicPaused = false; _playingStream = false; }
                 RefreshPlaylistView();
                 UpdateUI();
             }
@@ -301,7 +654,7 @@ namespace VirtualMicMixer
             {
                 _engine.ResumeMusic();
                 _musicPaused = false;
-                SetStatus($"▶  {_playlist.CurrentTrack?.Title ?? "Playing"}");
+                SetStatus($"▶  {CurrentPlaybackTitle}");
                 UpdateUI();
                 return;
             }
@@ -323,7 +676,7 @@ namespace VirtualMicMixer
             {
                 _engine.ResumeMusic();
                 _musicPaused = false;
-                SetStatus($"▶  {_playlist.CurrentTrack?.Title ?? "Playing"}");
+                SetStatus($"▶  {CurrentPlaybackTitle}");
             }
             else
             {
@@ -336,10 +689,13 @@ namespace VirtualMicMixer
 
         private void BtnStop_Click(object sender, EventArgs e)
         {
+            _streamCts?.Cancel();
             _engine.StopMusic();
             _musicPaused = false;
+            _playingStream = false;
             trkSeek.Value = 0;
             lblMusicPos.Text = "0:00";
+            lblMusicDur.Text = "/ 0:00";
             SetStatus("⏹  Stopped");
             UpdateUI();
         }
@@ -368,6 +724,7 @@ namespace VirtualMicMixer
             {
                 _engine.StopMusic();
                 _musicPaused = false;
+                _playingStream = false;
                 SetStatus("⏹  End of playlist.");
                 UpdateUI();
             }
@@ -383,6 +740,7 @@ namespace VirtualMicMixer
                 _engine.LoadMusic(entry.FilePath, chkLoop.Checked);
                 _engine.MusicVolume = trkMusicVol.Value / 100f;
                 _musicPaused = false;
+                _playingStream = false;
 
                 trkSeek.Maximum = Math.Max(1, (int)_engine.MusicDuration.TotalSeconds);
                 lblMusicDur.Text = $"/ {FormatTime(_engine.MusicDuration)}";
@@ -418,10 +776,26 @@ namespace VirtualMicMixer
         //
         private void Engine_MusicFinished(object sender, EventArgs e)
         {
+            if (_closing || !IsHandleCreated) return;
+
             // Always arrives on a pool thread – BeginInvoke is non-blocking here
             BeginInvoke(new Action(() =>
             {
                 _musicPaused = false;
+
+                // A finished stream must not advance the folder playlist.
+                if (_playingStream)
+                {
+                    _playingStream = false;
+                    _engine.StopMusic();
+                    lblNowPlaying.Text = "— No track selected —";
+                    lblMusicPos.Text = "0:00";
+                    lblMusicDur.Text = "/ 0:00";
+                    trkSeek.Value = 0;
+                    SetStatus("⏹  Stream finished.");
+                    UpdateUI();
+                    return;
+                }
 
                 var next = _playlist.Next();
                 if (next == null)
@@ -448,7 +822,7 @@ namespace VirtualMicMixer
         // ══ SEEK ══════════════════════════════════════════════════════════════
         private void TrkSeek_Scroll(object sender, EventArgs e)
         {
-            if (!_engine.IsMusicLoaded) return;
+            if (!_engine.IsMusicLoaded || !_engine.IsMusicSeekable) return;
             _engine.SeekMusic(TimeSpan.FromSeconds(trkSeek.Value));
         }
 
@@ -458,7 +832,7 @@ namespace VirtualMicMixer
             if (!_engine.IsMusicLoaded) return;
             var pos = _engine.MusicPosition;
             lblMusicPos.Text = FormatTime(pos);
-            if (_engine.MusicDuration.TotalSeconds > 0)
+            if (_engine.IsMusicSeekable && _engine.MusicDuration.TotalSeconds > 0)
                 trkSeek.Value = Math.Min(trkSeek.Maximum, (int)pos.TotalSeconds);
         }
 
@@ -536,13 +910,14 @@ namespace VirtualMicMixer
             bool eng = _engineRunning;
             bool music = _engine.IsMusicLoaded;
             bool hasTracks = _playlist.HasTracks;
+            bool busy = _streamBusy;
 
-            btnPlay.Enabled = eng;
-            btnPause.Enabled = eng && music;
-            btnStop.Enabled = eng && music;
-            btnPrev.Enabled = eng && hasTracks;
-            btnNext.Enabled = eng && hasTracks;
-            trkSeek.Enabled = eng && music;
+            btnPlay.Enabled = eng && !busy;
+            btnPause.Enabled = eng && music && !busy;
+            btnStop.Enabled = eng && (music || busy);
+            btnPrev.Enabled = eng && hasTracks && !busy;
+            btnNext.Enabled = eng && hasTracks && !busy;
+            trkSeek.Enabled = eng && music && _engine.IsMusicSeekable;
             trkMusicVol.Enabled = eng;
             chkMuteMusic.Enabled = eng;
 
@@ -563,6 +938,12 @@ namespace VirtualMicMixer
             tsslStatus.Text = msg;
             tsslStatus.ForeColor = color ?? Color.FromArgb(180, 180, 180);
         }
+
+        private string CurrentPlaybackTitle =>
+            _playingStream ? _streamTitle : (_playlist.CurrentTrack?.Title ?? "Playing");
+
+        private static string FirstLine(string text) =>
+            string.IsNullOrEmpty(text) ? "Unknown error" : text.Split('\n')[0].Trim();
 
         private static string FormatTime(TimeSpan t) =>
             t.TotalHours >= 1

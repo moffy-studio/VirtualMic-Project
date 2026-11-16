@@ -8,52 +8,45 @@ namespace VirtualMicMixer.Core
     public class PlaylistEntry
     {
         public string FilePath { get; set; }
-        public string Title { get; set; }   // display name (no extension)
-        public string Ext { get; set; }   // e.g. ".mp3"
+        public string Title { get; set; }
+        public string Ext { get; set; }
         public int OriginalIndex { get; set; }
     }
 
     public class PlaylistManager
     {
-        // ── Supported extensions ─────────────────────────────────────────────
-        private static readonly HashSet<string> AudioExts = new HashSet<string>(
-            StringComparer.OrdinalIgnoreCase)
+        private static readonly HashSet<string> AudioExts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus"
         };
 
-        // ── Internal state ────────────────────────────────────────────────────
-        private List<PlaylistEntry> _master = new List<PlaylistEntry>(); // original order
-        private List<PlaylistEntry> _queue = new List<PlaylistEntry>(); // playback order
+        private readonly List<PlaylistEntry> _master = new List<PlaylistEntry>();
+        private readonly Random _rng = new Random();
+        private List<PlaylistEntry> _queue = new List<PlaylistEntry>();
         private int _currentIndex = -1;
 
-        private readonly Random _rng = new Random();
-
-        // ── Public state ──────────────────────────────────────────────────────
         public bool ShuffleEnabled { get; private set; }
         public bool RepeatAll { get; private set; }
         public bool RepeatOne { get; private set; }
 
         public int Count => _master.Count;
         public bool HasTracks => _master.Count > 0;
-        public int CurrentIndex => _currentIndex;          // index in _queue
+        public int CurrentIndex => _currentIndex;
 
         public PlaylistEntry CurrentTrack =>
-            (_currentIndex >= 0 && _currentIndex < _queue.Count)
-                ? _queue[_currentIndex] : null;
+            (_currentIndex >= 0 && _currentIndex < _queue.Count) ? _queue[_currentIndex] : null;
 
-        /// <summary>Returns a snapshot of the current playback queue.</summary>
         public IReadOnlyList<PlaylistEntry> Queue => _queue.AsReadOnly();
 
-        // ── Load folder ───────────────────────────────────────────────────────
-        /// <summary>Scans a folder (non-recursive by default) and replaces the playlist.</summary>
         public List<PlaylistEntry> LoadFolder(string folder, bool recursive = false)
         {
-            var option = recursive
-                ? SearchOption.AllDirectories
-                : SearchOption.TopDirectoryOnly;
+            if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+            {
+                Clear();
+                return new List<PlaylistEntry>();
+            }
 
-            var files = Directory.GetFiles(folder, "*.*", option)
+            var files = Directory.GetFiles(folder, "*.*", recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly)
                 .Where(f => AudioExts.Contains(Path.GetExtension(f)))
                 .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
                 .ToList();
@@ -75,25 +68,31 @@ namespace VirtualMicMixer.Core
             return _queue.ToList();
         }
 
-        /// <summary>Adds individual files to the existing playlist.</summary>
         public void AddFiles(IEnumerable<string> files)
         {
-            foreach (var f in files)
+            if (files == null) return;
+
+            foreach (var file in files)
             {
-                if (!AudioExts.Contains(Path.GetExtension(f))) continue;
-                int idx = _master.Count;
+                if (string.IsNullOrWhiteSpace(file) || !File.Exists(file)) continue;
+                if (!AudioExts.Contains(Path.GetExtension(file))) continue;
+
                 _master.Add(new PlaylistEntry
                 {
-                    FilePath = f,
-                    Title = Path.GetFileNameWithoutExtension(f),
-                    Ext = Path.GetExtension(f).ToUpperInvariant().TrimStart('.'),
-                    OriginalIndex = idx
+                    FilePath = file,
+                    Title = Path.GetFileNameWithoutExtension(file),
+                    Ext = Path.GetExtension(file).ToUpperInvariant().TrimStart('.'),
+                    OriginalIndex = _master.Count
                 });
             }
+
             RebuildQueue();
+            if (_queue.Count == 0)
+                _currentIndex = -1;
+            else if (_currentIndex < 0)
+                _currentIndex = 0;
         }
 
-        /// <summary>Clears all tracks.</summary>
         public void Clear()
         {
             _master.Clear();
@@ -101,8 +100,6 @@ namespace VirtualMicMixer.Core
             _currentIndex = -1;
         }
 
-        // ── Navigation ────────────────────────────────────────────────────────
-        /// <summary>Jump to a specific queue index.</summary>
         public PlaylistEntry GoTo(int queueIndex)
         {
             if (queueIndex < 0 || queueIndex >= _queue.Count) return null;
@@ -110,12 +107,13 @@ namespace VirtualMicMixer.Core
             return _queue[_currentIndex];
         }
 
-        /// <summary>Advance to next track. Returns null if end of playlist.</summary>
         public PlaylistEntry Next()
         {
             if (_queue.Count == 0) return null;
+            if (_currentIndex < 0) _currentIndex = 0;
 
-            if (RepeatOne) return _queue[_currentIndex];
+            if (RepeatOne)
+                return _queue[_currentIndex];
 
             int next = _currentIndex + 1;
             if (next >= _queue.Count)
@@ -125,32 +123,54 @@ namespace VirtualMicMixer.Core
                     if (ShuffleEnabled) RebuildQueue();
                     next = 0;
                 }
-                else return null; // end of playlist
+                else
+                {
+                    _currentIndex = _queue.Count - 1;
+                    return null;
+                }
             }
 
             _currentIndex = next;
             return _queue[_currentIndex];
         }
 
-        /// <summary>Go back to previous track.</summary>
         public PlaylistEntry Previous()
         {
             if (_queue.Count == 0) return null;
-            int prev = Math.Max(0, _currentIndex - 1);
+            if (_currentIndex < 0) _currentIndex = 0;
+
+            int prev = _currentIndex - 1;
+            if (prev < 0)
+            {
+                if (RepeatAll)
+                    prev = _queue.Count - 1;
+                else
+                    prev = 0;
+            }
+
             _currentIndex = prev;
             return _queue[_currentIndex];
         }
 
-        // ── Playback modes ────────────────────────────────────────────────────
         public void SetShuffle(bool enabled)
         {
             ShuffleEnabled = enabled;
             var current = CurrentTrack;
             RebuildQueue();
-            // Restore position to the same track
+
             if (current != null)
-                _currentIndex = _queue.FindIndex(e => e.FilePath == current.FilePath);
-            if (_currentIndex < 0) _currentIndex = 0;
+            {
+                int currentIndex = _queue.FindIndex(e => e.FilePath == current.FilePath);
+                _currentIndex = currentIndex >= 0 ? currentIndex : 0;
+            }
+            else if (_queue.Count > 0)
+            {
+                _currentIndex = 0;
+            }
+            else
+            {
+                _currentIndex = -1;
+            }
         }
 
         public void SetRepeatAll(bool enabled)
@@ -165,18 +185,26 @@ namespace VirtualMicMixer.Core
             if (enabled) RepeatAll = false;
         }
 
-        // ── Remove a track by queue index ─────────────────────────────────────
         public void RemoveAt(int queueIndex)
         {
             if (queueIndex < 0 || queueIndex >= _queue.Count) return;
+
             var entry = _queue[queueIndex];
             _master.Remove(entry);
             _queue.RemoveAt(queueIndex);
+
+            if (_queue.Count == 0)
+            {
+                _currentIndex = -1;
+                return;
+            }
+
             if (_currentIndex >= _queue.Count)
                 _currentIndex = _queue.Count - 1;
+            else if (_currentIndex > queueIndex)
+                _currentIndex--;
         }
 
-        // ── Helpers ───────────────────────────────────────────────────────────
         private void RebuildQueue()
         {
             if (ShuffleEnabled)
