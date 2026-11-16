@@ -14,6 +14,8 @@ namespace VirtualMicMixer.Core
 
     public static class DeviceManager
     {
+        private const string VbCableMarker = "CABLE";
+
         // ── Output devices (WaveOut) ─────────────────────────────────────────
         public static List<AudioDeviceInfo> GetOutputDevices()
         {
@@ -21,12 +23,7 @@ namespace VirtualMicMixer.Core
             for (int i = 0; i < WaveOut.DeviceCount; i++)
             {
                 var cap = WaveOut.GetCapabilities(i);
-                list.Add(new AudioDeviceInfo
-                {
-                    Name = cap.ProductName,
-                    WaveIndex = i,
-                    IsVbCable = cap.ProductName.ToUpperInvariant().Contains("CABLE")
-                });
+                list.Add(CreateDeviceInfo(cap.ProductName, i));
             }
             return list;
         }
@@ -38,12 +35,7 @@ namespace VirtualMicMixer.Core
             for (int i = 0; i < WaveIn.DeviceCount; i++)
             {
                 var cap = WaveIn.GetCapabilities(i);
-                list.Add(new AudioDeviceInfo
-                {
-                    Name = cap.ProductName,
-                    WaveIndex = i,
-                    IsVbCable = cap.ProductName.ToUpperInvariant().Contains("CABLE")
-                });
+                list.Add(CreateDeviceInfo(cap.ProductName, i));
             }
             return list;
         }
@@ -54,7 +46,7 @@ namespace VirtualMicMixer.Core
             for (int i = 0; i < WaveOut.DeviceCount; i++)
             {
                 var cap = WaveOut.GetCapabilities(i);
-                if (cap.ProductName.ToUpperInvariant().Contains("CABLE"))
+                if (IsVbCableDevice(cap.ProductName))
                     return i;
             }
             return -1; // not found
@@ -68,10 +60,26 @@ namespace VirtualMicMixer.Core
             for (int i = 0; i < WaveIn.DeviceCount; i++)
             {
                 var cap = WaveIn.GetCapabilities(i);
-                if (cap.ProductName.ToUpperInvariant().Contains("CABLE"))
+                if (IsVbCableDevice(cap.ProductName))
                     return i;
             }
             return -1;
+        }
+
+        private static AudioDeviceInfo CreateDeviceInfo(string name, int waveIndex)
+        {
+            return new AudioDeviceInfo
+            {
+                Name = name ?? string.Empty,
+                WaveIndex = waveIndex,
+                IsVbCable = IsVbCableDevice(name)
+            };
+        }
+
+        private static bool IsVbCableDevice(string deviceName)
+        {
+            return !string.IsNullOrWhiteSpace(deviceName) &&
+                   deviceName.ToUpperInvariant().Contains(VbCableMarker);
         }
     }
 }

@@ -26,5 +26,50 @@ namespace VirtualMicMixer.Properties
                 return defaultInstance;
             }
         }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("")]
+        public string YtDlpPath
+        {
+            get
+            {
+                return ((string)(this["YtDlpPath"]));
+            }
+            set
+            {
+                this["YtDlpPath"] = value;
+            }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("")]
+        public string CookieBrowser
+        {
+            get
+            {
+                return ((string)(this["CookieBrowser"]));
+            }
+            set
+            {
+                this["CookieBrowser"] = value;
+            }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("")]
+        public string CookiesFile
+        {
+            get
+            {
+                return ((string)(this["CookiesFile"]));
+            }
+            set
+            {
+                this["CookiesFile"] = value;
+            }
+        }
     }
 }
